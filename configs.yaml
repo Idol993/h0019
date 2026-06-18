@@ -1,0 +1,76 @@
+# ===== 持续学习 LoRA 框架配置文件 =====
+
+# 基础模型配置
+model:
+  name_or_path: "bert-base-uncased"
+  task_type: "sequence_classification"
+  num_labels: 2
+
+# 训练配置
+training:
+  batch_size: 16
+  learning_rate: 2e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  max_seq_length: 128
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+# LoRA 配置
+lora:
+  initial_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  target_modules:
+    - "query"
+    - "value"
+  bias: "none"
+  task_type: "SEQ_CLS"
+
+# 持续学习配置
+continual_learning:
+  # 相似度计算时选取 Top-K 历史任务初始化
+  top_k_similar: 3
+  # LoRA 剪枝：保留累计能量占比阈值
+  prune_energy_threshold: 0.95
+  # 单层奇异值能量占比裁剪阈值（低于此值的秩维度裁剪）
+  singular_value_threshold: 0.05
+  # Replay Buffer：每个任务抽样样本数
+  replay_buffer_size_per_task: 50
+  # 新任务训练时 replay 数据占比
+  replay_ratio: 0.2
+
+# 任务流配置（可通过 --task-stream 覆盖）
+tasks:
+  - name: "task_0"
+    dataset: "glue:cola"
+    epochs: 5
+    num_labels: 2
+  - name: "task_1"
+    dataset: "glue:sst2"
+    epochs: 5
+    num_labels: 2
+  - name: "task_2"
+    dataset: "glue:mrpc"
+    epochs: 5
+    num_labels: 2
+  - name: "task_3"
+    dataset: "glue:qqp"
+    epochs: 3
+    num_labels: 2
+  - name: "task_4"
+    dataset: "glue:mnli"
+    epochs: 3
+    num_labels: 3
+
+# 断点续训配置
+resume:
+  enabled: true
+  resume_from_task: -1  # -1 表示从最近一个完成的任务恢复
+
+# 输出配置
+output:
+  lora_save_dir: "./loras"
+  eval_output_dir: "./eval_results"
+  save_best_only: true
+  log_to_stdout: true
