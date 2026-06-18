@@ -43,23 +43,23 @@ continual_learning:
 # 任务流配置（可通过 --task-stream 覆盖）
 tasks:
   - name: "task_0"
-    dataset: "glue:cola"
+    dataset: "nyu-mll/glue:cola"
     epochs: 5
     num_labels: 2
   - name: "task_1"
-    dataset: "glue:sst2"
+    dataset: "nyu-mll/glue:sst2"
     epochs: 5
     num_labels: 2
   - name: "task_2"
-    dataset: "glue:mrpc"
+    dataset: "nyu-mll/glue:mrpc"
     epochs: 5
     num_labels: 2
   - name: "task_3"
-    dataset: "glue:qqp"
+    dataset: "nyu-mll/glue:qqp"
     epochs: 3
     num_labels: 2
   - name: "task_4"
-    dataset: "glue:mnli"
+    dataset: "nyu-mll/glue:mnli"
     epochs: 3
     num_labels: 3
 

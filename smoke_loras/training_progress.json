@@ -1,0 +1,43 @@
+{
+  "task_order": [
+    "smoke_cola",
+    "smoke_mrpc",
+    "smoke_mnli"
+  ],
+  "progress_rows": [
+    {
+      "smoke_cola": 0.75,
+      "smoke_mrpc": 0.625,
+      "smoke_mnli": 0.25
+    },
+    {
+      "smoke_cola": 0.25,
+      "smoke_mrpc": 0.40625,
+      "smoke_mnli": 0.28125
+    },
+    {
+      "smoke_cola": 0.3125,
+      "smoke_mrpc": 0.59375,
+      "smoke_mnli": 0.3125
+    }
+  ],
+  "all_task_info": {
+    "smoke_cola": {
+      "dataset": "nyu-mll/glue:cola",
+      "num_labels": 2,
+      "epochs": 1
+    },
+    "smoke_mrpc": {
+      "dataset": "nyu-mll/glue:mrpc",
+      "num_labels": 2,
+      "epochs": 1
+    },
+    "smoke_mnli": {
+      "dataset": "nyu-mll/glue:mnli",
+      "num_labels": 3,
+      "epochs": 1
+    }
+  },
+  "device": "cpu",
+  "seed": 42
+}

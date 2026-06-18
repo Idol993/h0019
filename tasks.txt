@@ -1,7 +1,7 @@
 # 任务流文件格式: task_name dataset_path [epochs] [num_labels]
 # 每行一个任务，#开头的行为注释
-task_0 glue:cola 5 2
-task_1 glue:sst2 5 2
-task_2 glue:mrpc 5 2
-task_3 glue:qqp 3 2
-task_4 glue:mnli 3 3
+task_0 nyu-mll/glue:cola 5 2
+task_1 nyu-mll/glue:sst2 5 2
+task_2 nyu-mll/glue:mrpc 5 2
+task_3 nyu-mll/glue:qqp 3 2
+task_4 nyu-mll/glue:mnli 3 3

@@ -13,6 +13,24 @@ from peft import LoraConfig, get_peft_model, PeftModel, set_peft_model_state_dic
 from peft.utils import get_peft_model_state_dict as get_peft_state
 
 
+def _to_json_serializable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_serializable(v) for v in obj]
+    if isinstance(obj, set):
+        return [_to_json_serializable(v) for v in sorted(obj, key=lambda x: str(x))]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    return obj
+
+
 class ReplayBuffer(Dataset):
     def __init__(self):
         self.samples: List[Dict[str, Any]] = []
@@ -110,7 +128,7 @@ class LoRAManager:
         meta_path = os.path.join(task_path, "metadata.json")
 
         with open(config_path, "w") as f:
-            json.dump(lora_module.lora_config.to_dict(), f, indent=2)
+            json.dump(_to_json_serializable(lora_module.lora_config.to_dict()), f, indent=2)
 
         state_dict_cpu = OrderedDict({
             k: v.cpu() if isinstance(v, torch.Tensor) else v
@@ -119,7 +137,7 @@ class LoRAManager:
         torch.save(state_dict_cpu, state_path)
 
         with open(meta_path, "w") as f:
-            json.dump(lora_module.metadata, f, indent=2, default=str)
+            json.dump(_to_json_serializable(lora_module.metadata), f, indent=2, default=str)
 
         print(f"[LoRAManager] Saved LoRA for task '{task_name}' -> {task_path}")
 
@@ -181,6 +199,7 @@ class LoRAManager:
         self,
         task_weights: Dict[str, float],
         merged_name: str = "merged",
+        target_rank: Optional[int] = None,
     ) -> Tuple[LoraConfig, OrderedDict]:
         if len(task_weights) == 0:
             raise ValueError("No tasks specified for merging")
@@ -193,11 +212,22 @@ class LoRAManager:
         ref_module = self.registry[ref_task]
         base_config_dict = ref_module.lora_config.to_dict()
 
-        total_weight = sum(valid_tasks.values())
-        normalized_weights = {k: v / total_weight for k, v in valid_tasks.items()}
+        if target_rank is None:
+            target_rank = max(
+                [self.registry[t].lora_config.r for t in valid_tasks]
+            )
+            print(f"[LoRAManager] merge auto target_rank={target_rank}")
+
+        total_weight = sum(abs(v) for v in valid_tasks.values())
+        if total_weight < 1e-9:
+            # fall back to uniform weights
+            n = len(valid_tasks)
+            normalized_weights = {k: 1.0 / n for k in valid_tasks}
+        else:
+            normalized_weights = {k: v / total_weight for k, v in valid_tasks.items()}
 
         merged_state: OrderedDict = OrderedDict()
-        parameter_keys = None
+        canonical_keys = None
 
         for task_name, weight in normalized_weights.items():
             lora_module = self.registry[task_name]
@@ -205,10 +235,15 @@ class LoRAManager:
             if sd is None:
                 continue
 
-            if parameter_keys is None:
-                parameter_keys = list(sd.keys())
+            cur_rank = lora_module.lora_config.r
+            if cur_rank != target_rank:
+                print(f"[LoRAManager] align task '{task_name}' rank {cur_rank} -> {target_rank}")
+                sd = self._pad_or_truncate_state(sd, target_rank)
 
-            for key in parameter_keys:
+            if canonical_keys is None:
+                canonical_keys = list(sd.keys())
+
+            for key in canonical_keys:
                 if key not in sd:
                     continue
                 param = sd[key]
@@ -218,7 +253,7 @@ class LoRAManager:
                 if "lora_A" in key:
                     scaled = param * weight
                 elif "lora_B" in key:
-                    scaled = param  # B 不缩放，A 缩放后与 B 相乘等价于整体缩放
+                    scaled = param
                 else:
                     scaled = param * weight
 
@@ -226,17 +261,23 @@ class LoRAManager:
 
                 if key not in merged_state:
                     merged_state[key] = torch.zeros_like(scaled)
-                merged_state[key] = merged_state[key] + scaled
+                if merged_state[key].shape != scaled.shape:
+                    print(f"[LoRAManager] WARNING shape mismatch for {key}: "
+                          f"existing={merged_state[key].shape} vs new={scaled.shape}, using zeros_like(scaled)")
+                    merged_state[key] = scaled.clone()
+                else:
+                    merged_state[key] = merged_state[key] + scaled
 
-        ref_rank = ref_module.lora_config.r
-        merged_config = LoraConfig(**{**base_config_dict, "r": ref_rank})
+        merged_config = LoraConfig(**{**base_config_dict, "r": target_rank})
 
         merged_module = LoRAModule(merged_name, merged_config, merged_state, {
             "type": "merged",
             "task_weights": normalized_weights,
+            "target_rank": target_rank,
         })
         self.registry[merged_name] = merged_module
 
+        print(f"[LoRAManager] Merged {len(valid_tasks)} LoRAs into rank={target_rank} (weights: {normalized_weights})")
         return merged_config, merged_state
 
     def prune_lora(
@@ -431,34 +472,60 @@ class LoRAManager:
             }
         index_path = os.path.join(self.save_dir, "registry_index.json")
         with open(index_path, "w") as f:
-            json.dump(index, f, indent=2, default=str)
+            json.dump(_to_json_serializable(index), f, indent=2, default=str)
+
+    @staticmethod
+    def _gradient_signature_projection(
+        grad_list: List[Any], signature_dim: int = 512, seed: int = 42
+    ) -> np.ndarray:
+        def _to_numpy(g):
+            if isinstance(g, torch.Tensor):
+                return g.detach().cpu().float().numpy()
+            return np.asarray(g, dtype=np.float32)
+
+        tensors = [_to_numpy(g).reshape(-1) for g in grad_list if g is not None]
+        if len(tensors) == 0:
+            return np.zeros(signature_dim, dtype=np.float32)
+        flat = np.concatenate(tensors).astype(np.float32)
+
+        rng = np.random.RandomState(seed)
+        src_dim = flat.shape[0]
+        if src_dim == signature_dim:
+            return flat
+        if src_dim < signature_dim:
+            padded = np.zeros(signature_dim, dtype=np.float32)
+            padded[:src_dim] = flat
+            return padded
+        projection = rng.randn(signature_dim, src_dim).astype(np.float32) / np.sqrt(np.float32(signature_dim))
+        return projection @ flat
 
     def compute_task_similarity(
         self,
         new_task_name: str,
-        new_gradients: List[torch.Tensor],
+        new_gradients: List[Any],
         top_k: int = 3,
+        signature_dim: int = 512,
     ) -> List[Tuple[str, float]]:
-        similarities = []
-        new_grad_flat = torch.cat([g.flatten() for g in new_gradients if g is not None])
-        new_norm = torch.norm(new_grad_flat) + 1e-12
+        new_sig = self._gradient_signature_projection(new_gradients, signature_dim=signature_dim)
+        new_norm = np.linalg.norm(new_sig) + 1e-12
 
+        similarities = []
         for task_name in self.registry.keys():
             if task_name == new_task_name:
                 continue
-            if "gradients" not in self.registry[task_name].metadata:
+            metadata = self.registry[task_name].metadata
+            if "gradient_signature" in metadata:
+                hist_sig = np.asarray(metadata["gradient_signature"], dtype=np.float32)
+            elif "gradients" in metadata:
+                hist_sig = self._gradient_signature_projection(
+                    metadata["gradients"], signature_dim=signature_dim
+                )
+            else:
                 continue
 
-            hist_grads = self.registry[task_name].metadata["gradients"]
-            hist_flat = torch.cat([
-                torch.tensor(g) if not isinstance(g, torch.Tensor) else g.flatten()
-                for g in hist_grads
-            ])
-            hist_norm = torch.norm(hist_flat) + 1e-12
-
-            cosine = torch.dot(new_grad_flat, hist_flat) / (new_norm * hist_norm)
-            similarity = float(cosine.cpu().numpy())
-            similarities.append((task_name, similarity))
+            hist_norm = np.linalg.norm(hist_sig) + 1e-12
+            cosine = float(np.dot(new_sig, hist_sig) / (new_norm * hist_norm))
+            similarities.append((task_name, cosine))
 
         similarities.sort(key=lambda x: x[1], reverse=True)
         return similarities[:top_k]
@@ -469,23 +536,34 @@ class LoRAManager:
         similar_tasks: List[Tuple[str, float]],
     ) -> Tuple[LoraConfig, OrderedDict]:
         if len(similar_tasks) == 0:
+            print("[LoRAManager] No similar tasks available -> init from scratch")
             return base_lora_config, OrderedDict()
 
-        total_sim = sum(max(0.0, s) for _, s in similar_tasks) + 1e-12
-        weights = {task: max(0.0, sim) / total_sim for task, sim in similar_tasks}
+        # Shift similarities to be non-negative so we can form a valid weight distro
+        min_sim = min(s for _, s in similar_tasks)
+        if min_sim < 0:
+            shifted = [(t, s - min_sim + 1e-3) for t, s in similar_tasks]
+        else:
+            shifted = list(similar_tasks)
 
-        merged_config, merged_state = self.merge_loras(weights, merged_name="init_merge_tmp")
+        total_sim = sum(s for _, s in shifted) + 1e-12
+        weights = {task: sim / total_sim for task, sim in shifted}
 
-        if merged_config.r > base_lora_config.r:
-            merged_config = LoraConfig(**{**merged_config.to_dict(), "r": base_lora_config.r})
-            merged_state = self._pad_or_truncate_state(merged_state, base_lora_config.r)
-        elif merged_config.r < base_lora_config.r:
-            merged_state = self._pad_or_truncate_state(merged_state, base_lora_config.r)
-            merged_config = LoraConfig(**{**merged_config.to_dict(), "r": base_lora_config.r})
+        target_rank = base_lora_config.r
+        print(f"[LoRAManager] init from similar tasks: target_rank={target_rank}, sources={list(weights.keys())}")
+
+        merged_config, merged_state = self.merge_loras(
+            weights, merged_name="init_merge_tmp", target_rank=target_rank
+        )
+
+        if merged_config.r != target_rank:
+            merged_state = self._pad_or_truncate_state(merged_state, target_rank)
+            merged_config = LoraConfig(**{**merged_config.to_dict(), "r": target_rank})
 
         if "init_merge_tmp" in self.registry:
             del self.registry["init_merge_tmp"]
 
+        print(f"[LoRAManager] init done: final rank={merged_config.r}")
         return merged_config, merged_state
 
     def _pad_or_truncate_state(self, state_dict: OrderedDict, target_rank: int) -> OrderedDict:

@@ -1,0 +1,56 @@
+# ===== SMOKE TEST config: tiny settings for fast end-to-end validation =====
+
+model:
+  name_or_path: "google/bert_uncased_L-2_H-128_A-2"
+  task_type: "sequence_classification"
+  num_labels: 2
+
+training:
+  batch_size: 4
+  learning_rate: 5e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.0
+  max_seq_length: 32
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+lora:
+  initial_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  target_modules:
+    - "query"
+    - "value"
+  bias: "none"
+  task_type: "SEQ_CLS"
+
+continual_learning:
+  top_k_similar: 2
+  prune_energy_threshold: 0.80
+  singular_value_threshold: 0.10
+  replay_buffer_size_per_task: 8
+  replay_ratio: 0.1
+
+tasks:
+  - name: "smoke_cola"
+    dataset: "nyu-mll/glue:cola"
+    epochs: 1
+    num_labels: 2
+  - name: "smoke_mrpc"
+    dataset: "nyu-mll/glue:mrpc"
+    epochs: 1
+    num_labels: 2
+  - name: "smoke_mnli"
+    dataset: "nyu-mll/glue:mnli"
+    epochs: 1
+    num_labels: 3
+
+resume:
+  enabled: true
+  resume_from_task: -1
+
+output:
+  lora_save_dir: "./smoke_loras"
+  eval_output_dir: "./smoke_eval"
+  save_best_only: true
+  log_to_stdout: true

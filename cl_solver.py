@@ -23,7 +23,7 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, TaskType
 
 from datasets import load_dataset, concatenate_datasets
 
-from lora_manager import LoRAManager
+from lora_manager import LoRAManager, _to_json_serializable
 
 
 def set_seed(seed: int = 42):
@@ -65,6 +65,8 @@ def load_task_dataset(
     tokenizer,
     max_seq_length: int,
     num_labels: int,
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None,
 ):
     if ":" in dataset_spec:
         ds_name, ds_subset = dataset_spec.split(":", 1)
@@ -105,27 +107,27 @@ def load_task_dataset(
     else:
         val_key = None
 
-    if "test" in dataset:
-        test_key = "test"
-    elif "test_matched" in dataset:
-        test_key = "test_matched"
-    else:
-        test_key = None
+    train_split = dataset["train"]
+    if max_train_samples and max_train_samples < len(train_split):
+        train_split = train_split.select(range(max_train_samples))
 
     train_sent_keys, train_label_key = determine_keys("train")
-    train_ds = dataset["train"].map(
+    train_ds = train_split.map(
         lambda x: preprocess(x, train_sent_keys, train_label_key),
         batched=True,
-        remove_columns=[c for c in dataset["train"].column_names if c not in ("input_ids", "attention_mask", "labels")],
+        remove_columns=[c for c in train_split.column_names if c not in ("input_ids", "attention_mask", "labels")],
     )
 
     val_ds = None
     if val_key:
+        val_split = dataset[val_key]
+        if max_val_samples and max_val_samples < len(val_split):
+            val_split = val_split.select(range(max_val_samples))
         val_sent_keys, val_label_key = determine_keys(val_key)
-        val_ds = dataset[val_key].map(
+        val_ds = val_split.map(
             lambda x: preprocess(x, val_sent_keys, val_label_key),
             batched=True,
-            remove_columns=[c for c in dataset[val_key].column_names if c not in ("input_ids", "attention_mask", "labels")],
+            remove_columns=[c for c in val_split.column_names if c not in ("input_ids", "attention_mask", "labels")],
         )
 
     return train_ds, val_ds
@@ -162,28 +164,29 @@ def compute_accuracy(preds: List[int], labels: List[int]) -> float:
     return float((np.array(preds) == np.array(labels)).mean())
 
 
-def extract_gradients(
+def extract_lora_gradients(
     model: nn.Module,
     val_dataloader: DataLoader,
     device: str,
     max_batches: int = 5,
-) -> List[torch.Tensor]:
+) -> List[np.ndarray]:
     model.eval()
     model.zero_grad()
 
-    params_for_grad = []
+    lora_params: List[Tuple[str, nn.Parameter]] = []
     for name, p in model.named_parameters():
-        if p.requires_grad and "classifier" in name:
-            params_for_grad.append(p)
-        elif p.requires_grad and ("score" in name and "lora" not in name):
-            params_for_grad.append(p)
+        if p.requires_grad and ("lora_A" in name or "lora_B" in name):
+            lora_params.append((name, p))
 
-    if len(params_for_grad) == 0:
+    if len(lora_params) == 0:
+        print("[extract_lora_gradients] WARNING: no LoRA params found, falling back to all trainable params")
         for name, p in model.named_parameters():
-            if p.requires_grad and "lora" in name:
-                params_for_grad.append(p)
+            if p.requires_grad:
+                lora_params.append((name, p))
 
-    accumulated_grads = [torch.zeros_like(p.detach(), device="cpu") for p in params_for_grad]
+    accumulated: List[torch.Tensor] = [
+        torch.zeros_like(p.detach(), device="cpu") for _, p in lora_params
+    ]
     num_valid = 0
 
     loss_fn = nn.CrossEntropyLoss()
@@ -204,28 +207,44 @@ def extract_gradients(
             loss.backward()
 
             valid = True
-            for i, p in enumerate(params_for_grad):
-                if p.grad is not None:
-                    accumulated_grads[i] += p.grad.detach().cpu()
-                else:
+            for i, (_, p) in enumerate(lora_params):
+                if p.grad is None:
                     valid = False
+                    break
+                accumulated[i] += p.grad.detach().cpu()
 
             if valid:
                 num_valid += 1
             batch_idx += 1
 
-    if num_valid > 0:
-        accumulated_grads = [g / num_valid for g in accumulated_grads]
-
-    return [g for g in accumulated_grads if g.abs().sum() > 0]
-
-
-def gradients_to_list(grads: List[torch.Tensor]) -> List[List[float]]:
-    return [g.cpu().numpy().tolist() for g in grads]
+    if num_valid == 0:
+        return []
+    return [(g / num_valid).cpu().numpy() for g in accumulated]
 
 
-def list_to_gradients(grad_list: List[List[float]]) -> List[torch.Tensor]:
-    return [torch.tensor(np.array(g), dtype=torch.float32) for g in grad_list]
+def evaluate_all_tasks_from_model(
+    peft_model: nn.Module,
+    task_name_to_val_loader: Dict[str, DataLoader],
+    device: str,
+) -> Dict[str, float]:
+    peft_model.eval()
+    results: Dict[str, float] = {}
+    for test_task_name, loader in task_name_to_val_loader.items():
+        all_preds: List[int] = []
+        all_labels: List[int] = []
+        with torch.no_grad():
+            for batch in loader:
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                if "labels" not in batch:
+                    continue
+                outputs = peft_model(**batch)
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                preds = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
+                labels = batch["labels"].cpu().numpy().tolist()
+                all_preds.extend(preds)
+                all_labels.extend(labels)
+        results[test_task_name] = compute_accuracy(all_preds, all_labels)
+    return results
 
 
 def train_one_task(
@@ -307,6 +326,8 @@ def main():
     parser.add_argument("--resume-from", type=int, default=None, help="Resume from task index (overrides config)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no-cuda", action="store_true", help="Disable CUDA")
+    parser.add_argument("--max-train-samples", type=int, default=None, help="SMOKE: limit train samples per task")
+    parser.add_argument("--max-val-samples", type=int, default=None, help="SMOKE: limit val samples per task")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -334,24 +355,87 @@ def main():
     output_cfg = config["output"]
     resume_cfg = config.get("resume", {})
 
+    # --- normalize numeric configs (YAML parser can leave them as str on some versions) ---
+    for k in ("learning_rate", "weight_decay", "warmup_ratio", "max_grad_norm"):
+        if k in training_cfg and isinstance(training_cfg[k], str):
+            training_cfg[k] = float(training_cfg[k])
+    for k in ("batch_size", "max_seq_length", "gradient_accumulation_steps"):
+        if k in training_cfg and isinstance(training_cfg[k], str):
+            training_cfg[k] = int(training_cfg[k])
+    for k in ("initial_rank", "lora_alpha"):
+        if k in lora_cfg and isinstance(lora_cfg[k], str):
+            lora_cfg[k] = int(lora_cfg[k])
+    for k in ("lora_dropout",):
+        if k in lora_cfg and isinstance(lora_cfg[k], str):
+            lora_cfg[k] = float(lora_cfg[k])
+    for k in ("top_k_similar", "replay_buffer_size_per_task"):
+        if k in cl_cfg and isinstance(cl_cfg[k], str):
+            cl_cfg[k] = int(cl_cfg[k])
+    for k in ("prune_energy_threshold", "singular_value_threshold", "replay_ratio"):
+        if k in cl_cfg and isinstance(cl_cfg[k], str):
+            cl_cfg[k] = float(cl_cfg[k])
+
     lora_save_dir = output_cfg["lora_save_dir"]
     os.makedirs(lora_save_dir, exist_ok=True)
+    eval_output_dir = output_cfg.get("eval_output_dir", "./eval_results")
+    os.makedirs(eval_output_dir, exist_ok=True)
 
-    print(f"\n[CL-Solver] Loading base model: {model_cfg['name_or_path']}")
-    hf_config = AutoConfig.from_pretrained(model_cfg["name_or_path"])
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg["name_or_path"])
+    print(f"\n[CL-Solver] Loading tokenizer: {model_cfg['name_or_path']}")
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg["name_or_path"], use_fast=False)
 
-    base_model = AutoModelForSequenceClassification.from_pretrained(
+    print(f"\n[CL-Solver] Pre-loading validation datasets for ALL tasks...")
+    collator = DataCollatorWithPadding(
+        tokenizer=tokenizer,
+        padding="max_length",
+        max_length=training_cfg["max_seq_length"],
+    )
+
+    all_task_val_loaders: Dict[str, DataLoader] = {}
+    all_task_info: Dict[str, Dict[str, Any]] = {}
+    for t in tasks:
+        tname = t["name"]
+        num_labels = t.get("num_labels", model_cfg["num_labels"])
+        all_task_info[tname] = {
+            "dataset": t["dataset"],
+            "num_labels": num_labels,
+            "epochs": t["epochs"],
+        }
+        try:
+            _, val_ds = load_task_dataset(
+                t["dataset"], tokenizer,
+                training_cfg["max_seq_length"], num_labels,
+                max_val_samples=args.max_val_samples,
+            )
+            if val_ds is not None:
+                if args.max_val_samples:
+                    val_ds = val_ds.select(range(min(args.max_val_samples, len(val_ds))))
+                val_ds.set_format("torch")
+                all_task_val_loaders[tname] = DataLoader(
+                    val_ds,
+                    batch_size=training_cfg["batch_size"],
+                    shuffle=False,
+                    collate_fn=collator,
+                )
+                print(f"  - {tname}: {len(val_ds)} val samples, num_labels={num_labels}")
+            else:
+                print(f"  - {tname}: no val split found")
+        except Exception as e:
+            print(f"  - {tname}: FAILED to load ({e})")
+
+    print(f"[CL-Solver] Preloaded val loaders for {len(all_task_val_loaders)} tasks")
+
+    tmp_config = AutoConfig.from_pretrained(model_cfg["name_or_path"])
+    dummy_base = AutoModelForSequenceClassification.from_pretrained(
         model_cfg["name_or_path"],
         num_labels=model_cfg["num_labels"],
         ignore_mismatched_sizes=True,
-    ).to(device)
-
-    lora_manager = LoRAManager(base_model, save_dir=lora_save_dir, device=device)
+    )
+    lora_manager = LoRAManager(dummy_base, save_dir=lora_save_dir, device=device)
     loaded_existing = lora_manager.load_all_saved_loras()
     if loaded_existing:
         print(f"[CL-Solver] Loaded {len(loaded_existing)} existing LoRA modules: {loaded_existing}")
     lora_manager.load_replay_buffer()
+    del dummy_base
 
     resume_from_task = args.resume_from if args.resume_from is not None else resume_cfg.get("resume_from_task", -1)
     if resume_from_task == -1:
@@ -365,8 +449,18 @@ def main():
 
     print(f"[CL-Solver] Starting from task index {start_idx} (total {len(tasks)} tasks)")
 
-    performance_history: Dict[str, List[float]] = {}
-    task_order = []
+    progress_rows: List[Dict[str, float]] = []
+    task_order: List[str] = []
+    progress_path = os.path.join(lora_save_dir, "training_progress.json")
+    if os.path.exists(progress_path):
+        try:
+            with open(progress_path, "r") as f:
+                prev = json.load(f)
+            progress_rows = prev.get("progress_rows", [])
+            task_order = prev.get("task_order", [])
+            print(f"[CL-Solver] Resumed progress: {len(progress_rows)} rows already saved")
+        except Exception:
+            pass
 
     for t_idx in range(start_idx, len(tasks)):
         task_info = tasks[t_idx]
@@ -376,7 +470,7 @@ def main():
         num_labels = task_info.get("num_labels", model_cfg["num_labels"])
 
         print(f"\n{'='*60}")
-        print(f"[CL-Solver] Task {t_idx}/{len(tasks)}: '{task_name}' (dataset={dataset_spec}, epochs={num_epochs})")
+        print(f"[CL-Solver] Task {t_idx}/{len(tasks)}: '{task_name}' (dataset={dataset_spec}, epochs={num_epochs}, num_labels={num_labels})")
         print(f"{'='*60}")
         task_order.append(task_name)
 
@@ -385,21 +479,32 @@ def main():
                 dataset_spec, tokenizer,
                 training_cfg["max_seq_length"],
                 num_labels,
+                max_train_samples=args.max_train_samples,
+                max_val_samples=args.max_val_samples,
             )
         except Exception as e:
             print(f"[CL-Solver] ERROR loading dataset for '{task_name}': {e}")
             continue
 
+        if train_ds is None:
+            print(f"[CL-Solver] ERROR: no train split for '{task_name}'")
+            continue
+
+        if args.max_train_samples:
+            train_ds = train_ds.select(range(min(args.max_train_samples, len(train_ds))))
+            print(f"[CL-Solver] SMOKE: limited train samples to {len(train_ds)}")
+
         train_ds.set_format("torch")
         if val_ds:
+            if args.max_val_samples:
+                val_ds = val_ds.select(range(min(args.max_val_samples, len(val_ds))))
             val_ds.set_format("torch")
 
         existing_task_names = lora_manager.get_registered_tasks()
-        similar_tasks = []
+        similar_tasks: List[Tuple[str, float]] = []
         initialized_from_history = False
 
         if len(existing_task_names) > 0 and val_ds is not None:
-            tmp_config = AutoConfig.from_pretrained(model_cfg["name_or_path"], num_labels=num_labels)
             tmp_model = AutoModelForSequenceClassification.from_pretrained(
                 model_cfg["name_or_path"],
                 num_labels=num_labels,
@@ -416,28 +521,33 @@ def main():
             )
             tmp_peft = get_peft_model(tmp_model, tmp_lora_config)
 
-            collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="max_length", max_length=training_cfg["max_seq_length"])
-            tmp_val_loader = DataLoader(val_ds, batch_size=training_cfg["batch_size"], collate_fn=collator, shuffle=False)
+            tmp_val_loader = DataLoader(
+                val_ds, batch_size=training_cfg["batch_size"],
+                collate_fn=collator, shuffle=False,
+            )
 
-            print(f"[CL-Solver] Computing gradient signature for '{task_name}'...")
-            new_grads = extract_gradients(tmp_peft, tmp_val_loader, device)
+            print(f"[CL-Solver] Computing LoRA gradient signature for '{task_name}'...")
+            new_grads = extract_lora_gradients(tmp_peft, tmp_val_loader, device, max_batches=3)
             del tmp_model, tmp_peft
             torch.cuda.empty_cache() if device == "cuda" else None
 
-            similar_tasks = lora_manager.compute_task_similarity(
-                task_name, new_grads, top_k=cl_cfg["top_k_similar"]
-            )
+            if len(new_grads) > 0:
+                similar_tasks = lora_manager.compute_task_similarity(
+                    task_name, new_grads, top_k=cl_cfg["top_k_similar"]
+                )
+                if len(similar_tasks) > 0:
+                    print(f"[CL-Solver] Top-{min(cl_cfg['top_k_similar'], len(similar_tasks))} similar tasks:")
+                    for st_name, st_score in similar_tasks:
+                        print(f"    - {st_name}: cosine_sim={st_score:.4f}")
+                    initialized_from_history = True
+                else:
+                    print("[CL-Solver] No comparable historical signatures found -> init from scratch")
+            else:
+                print("[CL-Solver] Could not extract LoRA gradients -> init from scratch")
 
-            if len(similar_tasks) > 0:
-                print(f"[CL-Solver] Top-{cl_cfg['top_k_similar']} similar tasks:")
-                for st_name, st_score in similar_tasks:
-                    print(f"    - {st_name}: cosine_sim={st_score:.4f}")
-                initialized_from_history = True
-
-        current_config = AutoConfig.from_pretrained(model_cfg["name_or_path"], num_labels=num_labels)
         current_model = AutoModelForSequenceClassification.from_pretrained(
             model_cfg["name_or_path"],
-            config=current_config,
+            num_labels=num_labels,
             ignore_mismatched_sizes=True,
         ).to(device)
 
@@ -461,23 +571,22 @@ def main():
                 set_peft_model_state_dict(peft_model, init_state_dict)
                 print(f"[CL-Solver] Successfully applied historical LoRA initialization")
             except Exception as e:
-                print(f"[CL-Solver] Warning: Failed to apply init state: {e}")
+                print(f"[CL-Solver] Warning: Failed to apply init state, falling back to scratch: {e}")
 
         peft_model.print_trainable_parameters()
 
         all_train_ds = train_ds
         if len(lora_manager.replay_buffer) > 0 and cl_cfg.get("replay_ratio", 0) > 0:
             replay_samples = lora_manager.replay_buffer.get_all_samples()
-            replay_count = int(len(train_ds) * cl_cfg["replay_ratio"])
+            replay_count = int(max(1, len(train_ds)) * cl_cfg["replay_ratio"])
             replay_count = min(replay_count, len(replay_samples))
             if replay_count > 0:
                 replay_indices = np.random.choice(len(replay_samples), replay_count, replace=False)
                 selected_replays = [replay_samples[i] for i in replay_indices]
                 replay_ds = ReplayDatasetWrapper(selected_replays)
                 all_train_ds = ConcatDataset([train_ds, replay_ds])
-                print(f"[CL-Solver] Mixed {replay_count} replay samples into training data (total={len(all_train_ds)})")
+                print(f"[CL-Solver] Mixed {replay_count} replay samples (total={len(all_train_ds)})")
 
-        collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="max_length", max_length=training_cfg["max_seq_length"])
         train_loader = DataLoader(
             all_train_ds,
             batch_size=training_cfg["batch_size"],
@@ -510,29 +619,30 @@ def main():
             num_training_steps=total_train_steps,
         )
 
-        print(f"[CL-Solver] Training '{task_name}' for {num_epochs} epochs (total steps={total_train_steps})")
+        print(f"[CL-Solver] Training '{task_name}' for {num_epochs} epochs (steps={total_train_steps})")
         peft_model, final_val_acc = train_one_task(
             task_name, peft_model, train_loader, val_loader,
             optimizer, lr_scheduler, num_epochs, device,
             max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
         )
-        print(f"[CL-Solver] '{task_name}' best Val-Acc: {final_val_acc:.4f}")
+        print(f"[CL-Solver] '{task_name}' best Val-Acc on itself: {final_val_acc:.4f}")
 
-        performance_history[task_name] = [final_val_acc]
-
-        task_grads = None
+        task_grads_np: List[np.ndarray] = []
         if val_loader is not None:
-            task_grads = extract_gradients(peft_model, val_loader, device)
+            task_grads_np = extract_lora_gradients(peft_model, val_loader, device, max_batches=3)
 
         lora_manager.register_lora(task_name, base_lora_config, metadata={
             "val_accuracy": final_val_acc,
             "num_epochs": num_epochs,
             "dataset": dataset_spec,
+            "num_labels": num_labels,
+            "similar_tasks_init": [(n, float(s)) for n, s in similar_tasks],
         })
         lora_manager.save_lora(task_name, peft_model)
 
-        if task_grads is not None:
-            lora_manager.registry[task_name].metadata["gradients"] = gradients_to_list(task_grads)
+        if len(task_grads_np) > 0:
+            sig = lora_manager._gradient_signature_projection(task_grads_np).tolist()
+            lora_manager.registry[task_name].metadata["gradient_signature"] = sig
             lora_manager.save_lora(task_name)
 
         old_rank, new_rank = lora_manager.prune_lora(
@@ -541,6 +651,7 @@ def main():
             singular_value_threshold=cl_cfg["singular_value_threshold"],
         )
         lora_manager.save_lora(task_name)
+        print(f"[CL-Solver] '{task_name}' rank: {old_rank} -> {new_rank}")
 
         if val_ds is not None:
             lora_manager.add_to_replay_buffer(
@@ -551,27 +662,79 @@ def main():
 
         lora_manager.save_registry_index()
 
+        print(f"\n[CL-Solver] === PROGRESS SNAPSHOT: evaluating '{task_name}' on all {len(all_task_val_loaders)} tasks ===")
+        snapshot_row: Dict[str, float] = {}
+        for test_task_name in [t["name"] for t in tasks]:
+            if test_task_name not in all_task_val_loaders:
+                snapshot_row[test_task_name] = float("nan")
+                continue
+            test_num_labels = all_task_info[test_task_name]["num_labels"]
+            if test_num_labels == num_labels:
+                eval_model_ref = peft_model
+            else:
+                eval_cfg = AutoConfig.from_pretrained(model_cfg["name_or_path"], num_labels=test_num_labels)
+                tmp_eval_model = AutoModelForSequenceClassification.from_pretrained(
+                    model_cfg["name_or_path"],
+                    config=eval_cfg,
+                    ignore_mismatched_sizes=True,
+                ).to(device)
+                lora_mod = lora_manager.registry[task_name]
+                eval_model_ref = get_peft_model(tmp_eval_model, lora_mod.lora_config)
+                if lora_mod.state_dict is not None:
+                    try:
+                        set_peft_model_state_dict(eval_model_ref, lora_mod.state_dict)
+                    except Exception as e:
+                        print(f"    [WARN] load LoRA to {test_task_name} failed: {e}")
+
+            acc = 0.0
+            try:
+                all_preds: List[int] = []
+                all_labels: List[int] = []
+                eval_model_ref.eval()
+                with torch.no_grad():
+                    for batch in all_task_val_loaders[test_task_name]:
+                        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                        if "labels" not in batch:
+                            continue
+                        outputs = eval_model_ref(**batch)
+                        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                        preds = torch.argmax(logits, dim=-1).cpu().numpy().tolist()
+                        labels = batch["labels"].cpu().numpy().tolist()
+                        all_preds.extend(preds)
+                        all_labels.extend(labels)
+                acc = compute_accuracy(all_preds, all_labels)
+            except Exception as e:
+                print(f"    [WARN] eval on {test_task_name} failed: {e}")
+            snapshot_row[test_task_name] = acc
+            print(f"    {task_name} -> {test_task_name}: acc={acc:.4f}")
+
+            if test_num_labels != num_labels:
+                del eval_model_ref
+                torch.cuda.empty_cache() if device == "cuda" else None
+
+        progress_rows.append(snapshot_row)
+
+        with open(progress_path, "w") as f:
+            json.dump(_to_json_serializable({
+                "task_order": task_order,
+                "progress_rows": progress_rows,
+                "all_task_info": all_task_info,
+                "device": device,
+                "seed": args.seed,
+            }), f, indent=2, allow_nan=True)
+
         del peft_model, current_model
         torch.cuda.empty_cache() if device == "cuda" else None
 
-        print(f"\n[CL-Solver] Current registry: {lora_manager.get_registered_tasks()}")
+        print(f"\n[CL-Solver] Registry status:")
         for t_name in lora_manager.get_registered_tasks():
             mod = lora_manager.registry[t_name]
             print(f"    - {t_name}: rank={mod.current_rank}, acc={mod.metadata.get('val_accuracy', 'N/A')}")
 
     print(f"\n{'='*60}")
     print(f"[CL-Solver] All tasks completed! Total registered: {len(lora_manager.get_registered_tasks())}")
+    print(f"[CL-Solver] Training progress saved to {progress_path}")
     print(f"{'='*60}")
-
-    history_path = os.path.join(lora_save_dir, "training_history.json")
-    with open(history_path, "w") as f:
-        json.dump({
-            "task_order": task_order,
-            "performance_history": performance_history,
-            "device": device,
-            "seed": args.seed,
-        }, f, indent=2, default=str)
-    print(f"[CL-Solver] Training history saved to {history_path}")
 
 
 if __name__ == "__main__":

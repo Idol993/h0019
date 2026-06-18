@@ -1,0 +1,19 @@
+{
+  "task_order": [
+    "smoke_cola",
+    "smoke_mrpc",
+    "smoke_mnli"
+  ],
+  "avg_forgetting": 0.125,
+  "forgetting_per_task": {
+    "smoke_cola": 0.4375,
+    "smoke_mrpc": -0.1875
+  },
+  "avg_accuracy_final": 0.40625,
+  "avg_accuracy_seen_tasks": [
+    0.75,
+    0.328125,
+    0.40625
+  ],
+  "progress_source": "training_progress.json (3 rows)"
+}

@@ -1,0 +1,4 @@
+# SMOKE task stream: 2-class + 2-class + 3-class to exercise mixed-num_labels flows
+smoke_cola nyu-mll/glue:cola 1 2
+smoke_mrpc nyu-mll/glue:mrpc 1 2
+smoke_mnli nyu-mll/glue:mnli 1 3
